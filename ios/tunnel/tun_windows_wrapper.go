@@ -7,6 +7,11 @@ import (
 	"io"
 	"os/exec"
 
+	"net/http"
+	_ "net/http/pprof"
+
+	"time"
+
 	log "github.com/sirupsen/logrus"
 )
 
@@ -30,9 +35,55 @@ func initTUNwrapper(device Device) *tunWrapper {
 	t.buffer = make([][]byte, 1)
 	t.buffer[0] = make([]byte, mtu)
 	go func() {
+		// Create a counter to track events
+		eventCount := 0
+		// Adaptive sleep duration with exponential backoff
+		sleepTime := 50 * time.Millisecond
+		maxSleepTime := 500 * time.Millisecond
+		minSleepTime := 50 * time.Millisecond
+		emptyCounter := 0
+
 		for {
-			e := <-device.Events()
-			log.Infof("event: %v", e)
+			// Sleep first to reduce CPU usage
+			time.Sleep(sleepTime)
+
+			// Drain all pending events
+			drainCount := 0
+			for i := 0; i < 100; i++ { // Limit max events per cycle to prevent starvation
+				// Try to receive event in non-blocking way
+				select {
+				case _ = <-device.Events():
+					// Count drained events
+					drainCount++
+					eventCount++
+				default:
+					// No more events, exit the draining loop
+					goto doneDraining
+				}
+			}
+
+		doneDraining:
+			// Adjust sleep time based on activity
+			if drainCount > 0 {
+				// Events were found, reset to minimum sleep time for responsiveness
+				sleepTime = minSleepTime
+				emptyCounter = 0
+
+				// Log occasionally
+				if eventCount%100000 == 0 {
+					log.Infof("Processed %d events (total: %d)", drainCount, eventCount)
+				}
+			} else {
+				// No events found, gradually increase sleep time
+				emptyCounter++
+				if emptyCounter > 5 && sleepTime < maxSleepTime {
+					// Increase sleep time after several empty cycles (exponential backoff)
+					sleepTime = time.Duration(float64(sleepTime) * 1.5)
+					if sleepTime > maxSleepTime {
+						sleepTime = maxSleepTime
+					}
+				}
+			}
 		}
 	}()
 	return t
@@ -91,4 +142,10 @@ func setupWindowsTUN(tunnelInfo tunnelParameters) (io.ReadWriteCloser, error) {
 	log.Info(setIpAddr.String())
 
 	return initTUNwrapper(tunDevice), nil
+}
+
+func init() {
+	go func() {
+		http.ListenAndServe("localhost:6060", nil)
+	}()
 }
